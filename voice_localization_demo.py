@@ -139,14 +139,29 @@ def main():
                             time.sleep(1.5)  # Longer stabilization
                             print(f"   🔴 EAGLE - Checking 3 frames...")
                             
-                            # Try 3 frames (camera needs warm-up after movement)
+                            # OPTIMIZATION: Try 3 frames but stop early if confident detection found
                             detections = None
+                            best_detections = []
                             for check in range(3):
                                 time.sleep(0.3)  # Quick wait between frames
-                                detections = camera.detect_person(debug=(check == 0))
-                                if detections:
+                                current_detections = camera.detect_person(debug=(check == 0))
+                                
+                                if current_detections:
+                                    # Collect all detections across frames
+                                    best_detections.extend(current_detections)
                                     print(f"      ✓ Detected in frame {check+1}/3")
-                                    break
+                                    
+                                    # OPTIMIZATION: If we found high-confidence detection, stop early
+                                    if current_detections[0]['confidence'] > 0.7:
+                                        detections = current_detections
+                                        print(f"      ✓ High confidence detection - stopping early")
+                                        break
+                            
+                            # Use best detection across all frames
+                            if not detections and best_detections:
+                                # Sort by confidence and use best one
+                                best_detections.sort(key=lambda x: x['confidence'], reverse=True)
+                                detections = [best_detections[0]]
                             
                             # Debug: Show what we found
                             if detections:
@@ -179,15 +194,19 @@ def main():
                                     # Convert RGB to BGR (face_recognition lib via capstone expects BGR)
                                     bgr_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
                                     
-                                    # Get person bounding box and crop it
+                                    # Get person bounding box and crop it with padding for face
                                     bbox = best['bbox']  # (x, y, w, h) in normalized coords (0-1)
                                     height, width = bgr_frame.shape[:2]
-                                    x1 = int(bbox[0] * width)
-                                    y1 = int(bbox[1] * height)
-                                    x2 = int((bbox[0] + bbox[2]) * width)
-                                    y2 = int((bbox[1] + bbox[3]) * height)
                                     
-                                    # Crop person region
+                                    # OPTIMIZATION: Add padding to focus on upper body (where face is)
+                                    # This reduces the search area and speeds up face detection
+                                    padding = 0.1  # 10% padding
+                                    x1 = max(0, int((bbox[0] - padding) * width))
+                                    y1 = max(0, int(bbox[1] * height))  # No padding on top - face is at top
+                                    x2 = min(width, int((bbox[0] + bbox[2] + padding) * width))
+                                    y2 = min(height, int((bbox[1] + bbox[3] * 0.6) * height))  # Only upper 60% of person
+                                    
+                                    # Crop person region (upper body focus)
                                     person_roi = bgr_frame[y1:y2, x1:x2]
                                     
                                     if person_roi.size > 0:  # Make sure crop is valid
