@@ -17,15 +17,8 @@ import Animated, {
      useSharedValue,
      withSpring,
 } from 'react-native-reanimated';
+import * as ScreenOrientation from 'expo-screen-orientation';
 import { useRouter } from 'expo-router';
-
-// Optional screen orientation - may not be available in all environments
-let ScreenOrientation: any = null;
-try {
-     ScreenOrientation = require('expo-screen-orientation');
-} catch {
-     // expo-screen-orientation not available
-}
 
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { useRobot } from '@/context/robot-provider';
@@ -63,27 +56,27 @@ export default function ManualScreen() {
      const joystickY = useSharedValue(0);
      const joystickActive = useSharedValue(false);
 
-     // Lock to landscape on mount
+     // Force landscape orientation on mount
      useEffect(() => {
-          if (!ScreenOrientation) return;
-
-          const lockOrientation = async () => {
+          const lockToLandscape = async () => {
                try {
+                    // First unlock any existing lock
+                    await ScreenOrientation.unlockAsync();
+                    // Then lock to landscape
                     await ScreenOrientation.lockAsync(
-                         ScreenOrientation.OrientationLock.LANDSCAPE_RIGHT
+                         ScreenOrientation.OrientationLock.LANDSCAPE
                     );
-               } catch {
-                    // Orientation lock not supported
+                    console.log('Orientation locked to landscape');
+               } catch (err) {
+                    console.warn('Failed to lock orientation:', err);
                }
           };
-          lockOrientation();
+          
+          lockToLandscape();
 
           return () => {
-               try {
-                    ScreenOrientation.unlockAsync();
-               } catch {
-                    // Ignore cleanup errors
-               }
+               // Unlock when leaving this screen
+               ScreenOrientation.unlockAsync().catch(() => {});
           };
      }, []);
 

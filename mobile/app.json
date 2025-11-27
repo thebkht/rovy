@@ -3,7 +3,7 @@
     "name": "Jarvis Controller",
     "slug": "Jarvis Controller",
     "version": "1.0.0",
-    "orientation": "portrait",
+    "orientation": "default",
     "scheme": "jarviscontroller",
     "icon": "./assets/images/icons/ios-light.png",
     "userInterfaceStyle": "dark",
@@ -11,10 +11,16 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.jarvis.controller",
-      "icon": "./assets/ios.icon",
+      "icon": "./assets/images/icons/ios-light.png",
+      "requireFullScreen": false,
       "infoPlist": {
         "NSBluetoothAlwaysUsageDescription": "Jarvis Controller uses Bluetooth to securely provision and connect to your Jarvis.",
-        "NSMicrophoneUsageDescription": "Jarvis Controller uses your microphone to communicate with your Jarvis"
+        "NSMicrophoneUsageDescription": "Jarvis Controller uses your microphone to communicate with your Jarvis",
+        "UISupportedInterfaceOrientations": [
+          "UIInterfaceOrientationPortrait",
+          "UIInterfaceOrientationLandscapeLeft",
+          "UIInterfaceOrientationLandscapeRight"
+        ]
       }
     },
     "android": {
@@ -41,6 +47,7 @@
     },
     "plugins": [
       "expo-router",
+      "expo-screen-orientation",
       [
         "expo-av",
         {
