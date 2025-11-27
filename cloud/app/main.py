@@ -635,12 +635,17 @@ async def json_control_websocket(websocket: WebSocket):
                 left_speed = float(data.get("L", 0))
                 right_speed = float(data.get("R", 0))
                 
-                if base_controller and hasattr(base_controller, "set_motor"):
+                # Try set_motor first (Rover adapter), then base_speed_ctrl (direct BaseController)
+                if base_controller:
                     try:
-                        # Convert -1 to 1 range to motor values
-                        await anyio.to_thread.run_sync(
-                            base_controller.set_motor, left_speed, right_speed
-                        )
+                        if hasattr(base_controller, "set_motor"):
+                            await anyio.to_thread.run_sync(
+                                base_controller.set_motor, left_speed, right_speed
+                            )
+                        elif hasattr(base_controller, "base_speed_ctrl"):
+                            await anyio.to_thread.run_sync(
+                                base_controller.base_speed_ctrl, left_speed, right_speed
+                            )
                     except Exception as exc:
                         LOGGER.warning("Motor control failed: %s", exc)
                         
