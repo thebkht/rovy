@@ -10,8 +10,8 @@
 
 import axios, { AxiosInstance } from "axios";
 
-// Default Cloud PC IP (Tailscale)
-export const DEFAULT_CLOUD_URL = "http://100.121.110.125:8765";
+// Default Cloud PC IP (Tailscale) - FastAPI runs on port 8000
+export const DEFAULT_CLOUD_URL = "http://100.121.110.125:8000";
 
 export interface ChatRequest {
   message: string;
