@@ -978,6 +978,93 @@ async def text_to_speech(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Piper TTS for local speech on Pi
+_piper_voice = None
+PIPER_MODEL_PATH = "/home/rovy/rovy_client/models/piper/en_US-hfc_male-medium.onnx"
+AUDIO_DEVICE = "plughw:3,0"  # USB speaker
+
+
+def _get_piper_voice():
+    """Lazy load Piper voice model."""
+    global _piper_voice
+    if _piper_voice is None:
+        try:
+            from piper import PiperVoice
+            if os.path.exists(PIPER_MODEL_PATH):
+                _piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+                LOGGER.info("Piper TTS loaded successfully")
+            else:
+                LOGGER.warning(f"Piper model not found: {PIPER_MODEL_PATH}")
+        except ImportError:
+            LOGGER.warning("Piper not installed")
+        except Exception as e:
+            LOGGER.error(f"Failed to load Piper: {e}")
+    return _piper_voice
+
+
+def _speak_with_piper(text: str) -> bool:
+    """Synthesize and play speech through speakers."""
+    import wave
+    import subprocess
+    import tempfile
+    
+    voice = _get_piper_voice()
+    if not voice:
+        return False
+    
+    try:
+        # Synthesize audio
+        audio_bytes = b''
+        sample_rate = 22050
+        for chunk in voice.synthesize(text):
+            audio_bytes += chunk.audio_int16_bytes
+            sample_rate = chunk.sample_rate
+        
+        # Save to temp WAV file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            wav_path = f.name
+            with wave.open(f.name, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio_bytes)
+        
+        # Play through speaker
+        subprocess.run(
+            ['aplay', '-D', AUDIO_DEVICE, wav_path],
+            stderr=subprocess.DEVNULL,
+            timeout=30
+        )
+        
+        # Cleanup
+        os.unlink(wav_path)
+        return True
+        
+    except Exception as e:
+        LOGGER.error(f"Piper speak error: {e}")
+        return False
+
+
+@app.post("/speak", tags=["Speech"])
+async def speak_text(request: dict):
+    """Speak text through the robot's speakers using Piper TTS.
+    
+    This endpoint is for the Pi to speak responses from the cloud AI.
+    """
+    text = request.get("text", "")
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    
+    LOGGER.info(f"Speaking: {text[:50]}...")
+    
+    success = await anyio.to_thread.run_sync(_speak_with_piper, text)
+    
+    if success:
+        return {"status": "ok", "message": "Speech played"}
+    else:
+        raise HTTPException(status_code=503, detail="TTS not available")
+
+
 @app.get("/shot")
 async def single_frame() -> Response:
     """Serve a single JPEG frame without the additional camera namespace."""
