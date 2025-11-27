@@ -247,31 +247,66 @@ class RovyClient:
             print(f"[Parse Error] {e}")
     
     async def handle_speak(self, msg):
-        """Handle speak command - play TTS audio."""
+        """Handle speak command - play TTS audio using Piper."""
         text = msg.get('text', '')
         audio_b64 = msg.get('audio_base64')
         
         print(f"[Speak] {text[:50]}...")
         
         if audio_b64 and PLAYBACK_OK:
+            # Play pre-generated audio from server
             try:
                 audio_bytes = base64.b64decode(audio_b64)
-                
-                # Play WAV audio
                 audio_io = io.BytesIO(audio_bytes)
                 data, samplerate = sf.read(audio_io)
                 sd.play(data, samplerate)
                 sd.wait()
-                
+                return
             except Exception as e:
-                print(f"[Speak] Playback error: {e}")
-        else:
-            # Fallback: use espeak locally
+                print(f"[Speak] Server audio failed: {e}, trying Piper...")
+        
+        # Use Piper TTS locally on Pi
+        try:
+            import subprocess
+            import tempfile
+            import os
+            
+            # Piper TTS command - adjust voice path as needed
+            piper_voice = getattr(config, 'PIPER_VOICE', '/usr/share/piper/en_US-lessac-medium.onnx')
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                wav_path = f.name
+            
+            # Generate speech with Piper
+            proc = subprocess.run(
+                ['piper', '--model', piper_voice, '--output_file', wav_path],
+                input=text,
+                text=True,
+                capture_output=True,
+                timeout=30
+            )
+            
+            if proc.returncode == 0 and PLAYBACK_OK and os.path.exists(wav_path):
+                # Play the generated audio
+                data, samplerate = sf.read(wav_path)
+                sd.play(data, samplerate)
+                sd.wait()
+                os.unlink(wav_path)
+            else:
+                # Fallback to espeak
+                print(f"[Speak] Piper failed, trying espeak...")
+                subprocess.run(['espeak', text], timeout=30)
+                
+        except FileNotFoundError:
+            # Piper not installed, use espeak
+            print("[Speak] Piper not found, using espeak")
             import subprocess
             try:
                 subprocess.run(['espeak', text], timeout=30)
             except:
-                print(f"[Speak] No playback available: {text}")
+                print(f"[Speak] No TTS available: {text}")
+        except Exception as e:
+            print(f"[Speak] TTS error: {e}")
     
     async def handle_move(self, msg):
         """Handle movement command."""

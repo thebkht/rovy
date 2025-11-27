@@ -1,28 +1,27 @@
 """
-Cloud AI Assistant - Using Local LLM Models
-Uses llama.cpp with Gemma/Llama for text and LLaVA for vision.
+Cloud AI Assistant - Using Qwen2-VL for Vision + Text
+Fast VLM running on PC with RTX 4080 SUPER.
 """
 import os
 import re
 import gc
 import time
-import glob
 import logging
 from typing import Optional, Dict, Any
 from datetime import datetime
 
 logger = logging.getLogger('Assistant')
 
-# Try to import llama-cpp-python
-LLAMA_CPP_OK = False
+# Try to import Qwen2-VL dependencies
+QWEN_VL_OK = False
 try:
-    from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler
-    LLAMA_CPP_OK = True
-except ImportError:
-    logger.warning("llama-cpp-python not available")
-    logger.warning("Install: pip install llama-cpp-python")
-    logger.warning("For GPU: CMAKE_ARGS=\"-DLLAMA_CUDA=on\" pip install llama-cpp-python")
+    import torch
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    from qwen_vl_utils import process_vision_info
+    QWEN_VL_OK = True
+except ImportError as e:
+    logger.warning(f"Qwen2-VL not available: {e}")
+    logger.warning("Install: pip install transformers accelerate qwen-vl-utils torch")
 
 try:
     from PIL import Image
@@ -39,161 +38,83 @@ except ImportError:
 
 
 class CloudAssistant:
-    """AI Assistant using local LLM models via llama.cpp"""
+    """AI Assistant using Qwen2-VL for both vision and text."""
+    
+    MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
     
     def __init__(
         self,
-        text_model_path: str = None,
-        vision_model_path: str = None,
-        vision_mmproj_path: str = None,
-        n_gpu_layers: int = -1,
-        n_ctx: int = 2048,
-        lazy_load_vision: bool = True
+        model_id: str = None,
+        max_pixels: int = 1280 * 720,  # Limit image size for speed
+        lazy_load: bool = False
     ):
-        self.text_model_path = text_model_path
-        self.vision_model_path = vision_model_path
-        self.vision_mmproj_path = vision_mmproj_path
-        self.n_gpu_layers = n_gpu_layers
-        self.n_ctx = n_ctx
+        self.model_id = model_id or self.MODEL_ID
+        self.max_pixels = max_pixels
         
-        self.text_llm = None
-        self.vision_llm = None
-        self.vision_handler = None
+        self.model = None
+        self.processor = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        if not LLAMA_CPP_OK:
-            logger.error("llama-cpp-python is required!")
+        if not QWEN_VL_OK:
+            logger.error("Qwen2-VL dependencies not installed!")
             return
         
-        # Find models
-        self._find_models()
+        logger.info(f"Device: {self.device}")
+        logger.info(f"Model: {self.model_id}")
         
-        logger.info(f"Text model: {self.text_model_path}")
-        logger.info(f"Vision model: {self.vision_model_path}")
-        
-        # Clear GPU memory
-        self._free_gpu()
-        
-        # Load text model
-        self._load_text_model()
-        
-        # Load vision model (lazy or now)
-        if not lazy_load_vision:
-            self._load_vision_model()
-    
-    def _find_models(self):
-        """Auto-detect model paths."""
-        search_dirs = [
-            os.path.expanduser("~/.cache"),
-            os.path.expanduser("~/models"),
-            "./models",
-            "C:/models",
-            "D:/models",
-        ]
-        
-        # Find text model
-        if not self.text_model_path:
-            patterns = ["gemma*.gguf", "llama*.gguf", "mistral*.gguf", "phi*.gguf"]
-            self.text_model_path = self._search_model(search_dirs, patterns)
-        
-        # Find vision model
-        if not self.vision_model_path:
-            patterns = ["llava*.gguf"]
-            self.vision_model_path = self._search_model(search_dirs, patterns)
-        
-        # Find vision projector
-        if not self.vision_mmproj_path and self.vision_model_path:
-            patterns = ["mmproj*.gguf", "llava*mmproj*.gguf"]
-            self.vision_mmproj_path = self._search_model(search_dirs, patterns)
-    
-    def _search_model(self, dirs: list, patterns: list) -> Optional[str]:
-        """Search for a model file."""
-        for directory in dirs:
-            if not os.path.exists(directory):
-                continue
-            for pattern in patterns:
-                matches = glob.glob(os.path.join(directory, pattern))
-                for match in matches:
-                    if os.path.isfile(match) and os.path.getsize(match) > 1_000_000:
-                        return match
-        return None
+        if not lazy_load:
+            self._load_model()
     
     def _free_gpu(self):
         """Free GPU memory."""
         gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    def _load_text_model(self):
-        """Load the text LLM."""
-        if self.text_llm:
+    def _load_model(self):
+        """Load the Qwen2-VL model."""
+        if self.model is not None:
             return
         
-        if not self.text_model_path or not os.path.exists(self.text_model_path):
-            logger.error(f"Text model not found: {self.text_model_path}")
-            return
-        
-        logger.info("Loading text model...")
+        logger.info("Loading Qwen2-VL model...")
         start = time.time()
         
-        try:
-            self.text_llm = Llama(
-                model_path=self.text_model_path,
-                n_gpu_layers=self.n_gpu_layers,
-                n_ctx=self.n_ctx,
-                n_threads=os.cpu_count() or 4,
-                n_batch=512,
-                verbose=False,
-            )
-            logger.info(f"✅ Text model loaded in {time.time() - start:.1f}s")
-        except Exception as e:
-            logger.error(f"Failed to load text model: {e}")
-    
-    def _load_vision_model(self):
-        """Load the vision LLM."""
-        if self.vision_llm:
-            return
-        
-        if not self.vision_model_path or not os.path.exists(self.vision_model_path):
-            logger.warning(f"Vision model not found: {self.vision_model_path}")
-            return
-        
-        if not self.vision_mmproj_path or not os.path.exists(self.vision_mmproj_path):
-            logger.warning(f"Vision projector not found: {self.vision_mmproj_path}")
-            return
-        
-        logger.info("Loading vision model...")
-        start = time.time()
+        self._free_gpu()
         
         try:
-            self.vision_handler = Llava15ChatHandler(
-                clip_model_path=self.vision_mmproj_path,
-                verbose=False
+            # Load model fully on GPU
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_id,
+                torch_dtype=torch.bfloat16,
+                device_map="cuda:0",
+                attn_implementation="eager",  # or "flash_attention_2" if installed
             )
             
-            self.vision_llm = Llama(
-                model_path=self.vision_model_path,
-                chat_handler=self.vision_handler,
-                n_gpu_layers=self.n_gpu_layers,
-                n_ctx=2048,
-                n_threads=os.cpu_count() or 4,
-                n_batch=512,
-                logits_all=True,
-                verbose=False,
+            # Load processor
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_id,
+                min_pixels=256 * 256,
+                max_pixels=self.max_pixels,
             )
-            logger.info(f"✅ Vision model loaded in {time.time() - start:.1f}s")
+            
+            logger.info(f"✅ Qwen2-VL loaded in {time.time() - start:.1f}s")
+            
+            # Log VRAM usage
+            if torch.cuda.is_available():
+                vram_used = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"VRAM used: {vram_used:.1f}GB")
+                
         except Exception as e:
-            logger.error(f"Failed to load vision model: {e}")
+            logger.error(f"Failed to load model: {e}")
+            self.model = None
+            self.processor = None
     
-    def ask(self, question: str, max_tokens: int = 150, temperature: float = 0.7) -> str:
+    def ask(self, question: str, max_tokens: int = 150, temperature: float = 0.3) -> str:
         """Ask a text-only question."""
-        if not self.text_llm:
-            self._load_text_model()
-            if not self.text_llm:
-                return "Text model not available."
+        if not self.model:
+            self._load_model()
+            if not self.model:
+                return "Model not available."
         
         logger.info(f"Query: {question}")
         start = time.time()
@@ -204,21 +125,44 @@ class CloudAssistant:
             if any(p in question.lower() for p in ['time', 'date', 'today', 'day']):
                 time_ctx = f"Current: {datetime.now().strftime('%I:%M %p, %A %B %d, %Y')}. "
             
-            response = self.text_llm.create_chat_completion(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"You are Rovy, a helpful robot assistant. {time_ctx}Give concise answers under 50 words."
-                    },
-                    {"role": "user", "content": question}
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
+            # Qwen2-VL works better with instruction in user message
+            system_instruction = "You are Jarvis, a friendly robot assistant. Always refer to yourself as Jarvis. Be concise (under 50 words)."
+            prompt = f"{system_instruction}\n{time_ctx}{question}"
+            messages = [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": prompt}]
+                }
+            ]
+            
+            # Prepare input
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
+            inputs = self.processor(
+                text=[text],
+                padding=True,
+                return_tensors="pt"
+            ).to(self.device)
             
-            answer = response['choices'][0]['message']['content'].strip()
+            # Generate
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    min_new_tokens=3,  # Prevent cutting off too early
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                )
+            
+            # Decode response
+            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+            answer = self.processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
+            
             answer = self._clean(answer)
-            
             logger.info(f"Response in {time.time() - start:.1f}s")
             return answer
             
@@ -228,15 +172,13 @@ class CloudAssistant:
     
     def ask_with_vision(self, question: str, image, max_tokens: int = 200) -> str:
         """Ask a question about an image."""
-        if not self.vision_llm:
-            self._load_vision_model()
-            if not self.vision_llm:
-                return "Vision model not available."
+        if not self.model:
+            self._load_model()
+            if not self.model:
+                return "Model not available."
         
         logger.info(f"Vision query: {question}")
         start = time.time()
-        
-        self.vision_llm.reset()
         
         try:
             # Convert to PIL Image
@@ -244,32 +186,49 @@ class CloudAssistant:
             if not pil_img:
                 return "Could not process image."
             
-            # Convert to base64
-            import io
-            import base64
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=70)
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            # Resize if too large (for speed)
+            pil_img = self._resize_image(pil_img)
             
-            response = self.vision_llm.create_chat_completion(
-                messages=[{
+            messages = [
+                {
                     "role": "user",
                     "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        {"type": "image", "image": pil_img},
                         {"type": "text", "text": question}
                     ]
-                }],
-                max_tokens=max_tokens,
-                temperature=0.3,
+                }
+            ]
+            
+            # Prepare input
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
+            image_inputs, video_inputs = process_vision_info(messages)
             
-            answer = ""
-            if 'choices' in response and response['choices']:
-                choice = response['choices'][0]
-                if 'message' in choice:
-                    answer = choice['message'].get('content', '')
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt"
+            ).to(self.device)
             
-            answer = self._clean(answer.strip())
+            # Generate
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=0.3,
+                    do_sample=True,
+                )
+            
+            # Decode response
+            generated_ids = output_ids[:, inputs.input_ids.shape[1]:]
+            answer = self.processor.batch_decode(
+                generated_ids, skip_special_tokens=True
+            )[0]
+            
+            answer = self._clean(answer)
             logger.info(f"Vision response in {time.time() - start:.1f}s")
             return answer if answer else "I couldn't understand what I'm seeing."
             
@@ -277,23 +236,32 @@ class CloudAssistant:
             logger.error(f"Vision query failed: {e}")
             return f"Error: {e}"
     
-    def _to_pil(self, image):
+    def _resize_image(self, img: Image.Image, max_size: int = 1280) -> Image.Image:
+        """Resize image for faster processing."""
+        w, h = img.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+        return img
+    
+    def _to_pil(self, image) -> Optional[Image.Image]:
         """Convert various formats to PIL Image."""
         if not PIL_OK:
             return None
         
         try:
             if isinstance(image, Image.Image):
-                return image
+                return image.convert("RGB")
             if isinstance(image, bytes):
                 import io
-                return Image.open(io.BytesIO(image))
+                return Image.open(io.BytesIO(image)).convert("RGB")
             if isinstance(image, np.ndarray):
-                if CV2_OK:
+                if CV2_OK and len(image.shape) == 3 and image.shape[2] == 3:
                     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                return Image.fromarray(image)
+                return Image.fromarray(image).convert("RGB")
             if isinstance(image, str) and os.path.exists(image):
-                return Image.open(image)
+                return Image.open(image).convert("RGB")
         except Exception as e:
             logger.error(f"Image conversion failed: {e}")
         return None
@@ -337,4 +305,3 @@ class CloudAssistant:
                     return {'direction': direction, 'distance': dist, 'speed': speed}
         
         return None
-

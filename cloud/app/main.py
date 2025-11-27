@@ -687,18 +687,48 @@ async def json_control_websocket(websocket: WebSocket):
             pass
 
 
+# Global AI instances (lazy loaded)
+_assistant = None
+_speech = None
+
+def _get_assistant():
+    """Get or create CloudAssistant instance."""
+    global _assistant
+    if _assistant is None:
+        try:
+            from ai import CloudAssistant
+            _assistant = CloudAssistant()
+            LOGGER.info("CloudAssistant loaded for voice endpoint")
+        except Exception as e:
+            LOGGER.error(f"Failed to load CloudAssistant: {e}")
+    return _assistant
+
+def _get_speech():
+    """Get or create SpeechProcessor instance."""
+    global _speech
+    if _speech is None:
+        try:
+            from speech import SpeechProcessor
+            _speech = SpeechProcessor()
+            LOGGER.info("SpeechProcessor loaded for voice endpoint")
+        except Exception as e:
+            LOGGER.error(f"Failed to load SpeechProcessor: {e}")
+    return _speech
+
+
 @app.websocket("/voice")
 async def voice_websocket(websocket: WebSocket):
     """WebSocket endpoint for voice interaction from mobile app.
     
     Receives: {"type": "audio_chunk", "encoding": "base64", "data": "..."}
               {"type": "audio_end", "encoding": "base64", "sampleRate": 16000}
+              {"type": "text", "text": "..."}  # Direct text query
     
     Sends:    {"type": "status", "message": "..."}
               {"type": "chunk_received"}
               {"type": "audio_complete", "total_chunks": N}
               {"type": "transcript", "text": "..."}
-              {"type": "response", "text": "...", "audio_base64": "..."}
+              {"type": "response", "text": "..."}
     """
     await websocket.accept()
     LOGGER.info("Voice WebSocket connected from mobile app")
@@ -706,7 +736,7 @@ async def voice_websocket(websocket: WebSocket):
     audio_chunks = []
     
     try:
-        await websocket.send_json({"type": "status", "message": "Voice connection ready"})
+        await websocket.send_json({"type": "status", "message": "Jarvis ready"})
         
         while True:
             data = await websocket.receive_json()
@@ -728,37 +758,90 @@ async def voice_websocket(websocket: WebSocket):
                 
                 if total_chunks > 0:
                     # Combine all chunks
-                    import base64
                     full_audio_b64 = "".join(audio_chunks)
                     audio_chunks = []  # Reset for next recording
                     
                     sample_rate = data.get("sampleRate", 16000)
                     
-                    # Try to process with AI if available (PC only)
-                    try:
-                        # Check if we have AI modules (PC server)
-                        from speech import SpeechProcessor
-                        from ai import CloudAssistant
-                        import config
-                        
-                        # These would be loaded in the server
-                        # For now, just acknowledge receipt
+                    # Transcribe audio
+                    speech = _get_speech()
+                    if speech:
+                        try:
+                            audio_bytes = base64.b64decode(full_audio_b64)
+                            transcript = await anyio.to_thread.run_sync(
+                                speech.transcribe, audio_bytes, sample_rate
+                            )
+                            
+                            if transcript:
+                                await websocket.send_json({
+                                    "type": "transcript",
+                                    "text": transcript
+                                })
+                                
+                                # Get AI response
+                                assistant = _get_assistant()
+                                if assistant:
+                                    response = await anyio.to_thread.run_sync(
+                                        assistant.ask, transcript
+                                    )
+                                    await websocket.send_json({
+                                        "type": "response",
+                                        "text": response
+                                    })
+                                    
+                                    # Also send to robot for TTS playback
+                                    try:
+                                        import sys
+                                        sys.path.insert(0, str(Path(__file__).parent.parent))
+                                        from main import broadcast_to_robot
+                                        await broadcast_to_robot(response)
+                                    except Exception as e:
+                                        LOGGER.warning(f"Could not broadcast to robot: {e}")
+                                else:
+                                    await websocket.send_json({
+                                        "type": "response",
+                                        "text": "AI assistant not available"
+                                    })
+                            else:
+                                await websocket.send_json({
+                                    "type": "status",
+                                    "message": "Could not transcribe audio"
+                                })
+                        except Exception as e:
+                            LOGGER.error(f"Audio processing error: {e}")
+                            await websocket.send_json({
+                                "type": "error",
+                                "message": str(e)
+                            })
+                    else:
                         await websocket.send_json({
                             "type": "status",
-                            "message": f"Received {total_chunks} audio chunks. AI processing available on PC server."
-                        })
-                        
-                    except ImportError:
-                        # No AI modules - this is the Pi, not PC
-                        await websocket.send_json({
-                            "type": "status", 
-                            "message": f"Received {total_chunks} audio chunks. Connect to PC cloud server for AI processing."
+                            "message": "Speech processor not available"
                         })
                 else:
                     await websocket.send_json({
                         "type": "status",
                         "message": "No audio data received"
                     })
+            
+            elif msg_type == "text":
+                # Direct text query (no audio)
+                text = data.get("text", "")
+                if text:
+                    assistant = _get_assistant()
+                    if assistant:
+                        response = await anyio.to_thread.run_sync(
+                            assistant.ask, text
+                        )
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": response
+                        })
+                    else:
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": "AI assistant not available"
+                        })
                     
             elif msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -770,6 +853,129 @@ async def voice_websocket(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+
+
+# ============================================================================
+# AI Chat/Vision REST Endpoints (for mobile app cloud-api.ts)
+# ============================================================================
+
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    message: str
+    max_tokens: int = 150
+    temperature: float = 0.3
+
+class ChatResponse(BaseModel):
+    response: str
+    movement: dict | None = None
+
+class VisionRequest(BaseModel):
+    question: str
+    image_base64: str
+    max_tokens: int = 200
+
+class VisionResponse(BaseModel):
+    response: str
+    movement: dict | None = None
+
+
+@app.post("/chat", response_model=ChatResponse, tags=["AI"])
+async def chat_endpoint(request: ChatRequest) -> ChatResponse:
+    """Chat with Jarvis AI (text only)."""
+    assistant = _get_assistant()
+    if not assistant:
+        raise HTTPException(status_code=503, detail="AI assistant not available")
+    
+    try:
+        response = await anyio.to_thread.run_sync(
+            assistant.ask, request.message, request.max_tokens, request.temperature
+        )
+        
+        # Check for movement commands
+        movement = None
+        if hasattr(assistant, 'extract_movement'):
+            movement = assistant.extract_movement(response, request.message)
+        
+        # Broadcast response to robot for TTS playback on Pi speakers
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from main import broadcast_to_robot
+            await broadcast_to_robot(response)
+        except Exception as e:
+            LOGGER.warning(f"Could not broadcast to robot: {e}")
+        
+        return ChatResponse(response=response, movement=movement)
+    except Exception as e:
+        LOGGER.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/vision", response_model=VisionResponse, tags=["AI"])
+async def vision_endpoint(request: VisionRequest) -> VisionResponse:
+    """Ask Jarvis about an image."""
+    assistant = _get_assistant()
+    if not assistant:
+        raise HTTPException(status_code=503, detail="AI assistant not available")
+    
+    try:
+        # Decode image
+        image_bytes = base64.b64decode(request.image_base64)
+        
+        response = await anyio.to_thread.run_sync(
+            assistant.ask_with_vision, request.question, image_bytes, request.max_tokens
+        )
+        
+        # Check for movement commands
+        movement = None
+        if hasattr(assistant, 'extract_movement'):
+            movement = assistant.extract_movement(response, request.question)
+        
+        return VisionResponse(response=response, movement=movement)
+    except Exception as e:
+        LOGGER.error(f"Vision error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/stt", tags=["AI"])
+async def speech_to_text(audio: UploadFile = File(...)):
+    """Convert speech to text using Whisper."""
+    speech = _get_speech()
+    if not speech:
+        raise HTTPException(status_code=503, detail="Speech processor not available")
+    
+    try:
+        audio_bytes = await audio.read()
+        transcript = await anyio.to_thread.run_sync(
+            speech.transcribe, audio_bytes, 16000
+        )
+        return {"text": transcript, "success": bool(transcript)}
+    except Exception as e:
+        LOGGER.error(f"STT error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tts", tags=["AI"])
+async def text_to_speech(request: dict):
+    """Convert text to speech."""
+    speech = _get_speech()
+    if not speech:
+        raise HTTPException(status_code=503, detail="Speech processor not available")
+    
+    text = request.get("text", "")
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    
+    try:
+        audio_bytes = await anyio.to_thread.run_sync(speech.synthesize, text)
+        if audio_bytes:
+            return Response(content=audio_bytes, media_type="audio/wav")
+        else:
+            raise HTTPException(status_code=500, detail="TTS failed")
+    except Exception as e:
+        LOGGER.error(f"TTS error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/shot")

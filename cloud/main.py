@@ -280,15 +280,9 @@ class RovyCloudServer:
         
         if AI_OK and CloudAssistant:
             try:
-                self.assistant = CloudAssistant(
-                    text_model_path=config.TEXT_MODEL_PATH,
-                    vision_model_path=config.VISION_MODEL_PATH,
-                    vision_mmproj_path=config.VISION_MMPROJ_PATH,
-                    n_gpu_layers=config.N_GPU_LAYERS,
-                    n_ctx=config.N_CTX,
-                    lazy_load_vision=True
-                )
-                logger.info("✅ AI assistant ready")
+                # Qwen2-VL - no parameters needed, uses defaults
+                self.assistant = CloudAssistant()
+                logger.info("✅ AI assistant ready (Qwen2-VL)")
             except Exception as e:
                 logger.error(f"AI init failed: {e}")
         
@@ -352,6 +346,21 @@ class RovyCloudServer:
 
 
 server: RovyCloudServer = None
+
+
+def get_server() -> RovyCloudServer:
+    """Get the global server instance (for use by FastAPI endpoints)."""
+    return server
+
+
+async def broadcast_to_robot(text: str):
+    """Send a speak command to all connected robots."""
+    if server and server.robot.clients:
+        msg = {"type": "speak", "text": text}
+        await server.robot.broadcast(msg)
+        logger.info(f"🔊 Broadcast to robot: '{text[:50]}...'")
+        return True
+    return False
 
 
 def signal_handler(sig, frame):
