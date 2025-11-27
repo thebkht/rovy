@@ -635,6 +635,10 @@ async def json_control_websocket(websocket: WebSocket):
                 left_speed = float(data.get("L", 0))
                 right_speed = float(data.get("R", 0))
                 
+                # Invert controls (forward/backward and left/right are reversed on hardware)
+                left_speed = -left_speed
+                right_speed = -right_speed
+                
                 # Try set_motor first (Rover adapter), then base_speed_ctrl (direct BaseController)
                 if base_controller:
                     try:
