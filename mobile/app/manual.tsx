@@ -1,85 +1,118 @@
-import { Image } from 'expo-image';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
      ActivityIndicator,
+     Dimensions,
+     Image,
+     Platform,
      Pressable,
+     StatusBar,
      StyleSheet,
      Text,
-     View
+     View,
 } from 'react-native';
-
+import { Gesture, GestureDetector, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated, {
+     runOnJS,
+     useAnimatedStyle,
+     useSharedValue,
+     withSpring,
+} from 'react-native-reanimated';
 import { useRouter } from 'expo-router';
 
-import { CameraVideo } from '@/components/camera-video';
-import { Joystick } from '@/components/joystick';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
+// Optional screen orientation - may not be available in all environments
+let ScreenOrientation: any = null;
+try {
+     ScreenOrientation = require('expo-screen-orientation');
+} catch {
+     // expo-screen-orientation not available
+}
+
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { useRobot } from '@/context/robot-provider';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import { cmd_lights_ctrl, cmdJsonCmd } from '@/services/json-socket';
+import {
+     cmdJsonCmd,
+     cmd_movition_ctrl,
+     cmd_lights_ctrl,
+     cmd_gimbal_ctrl,
+     max_speed,
+     GimbalCommand,
+} from '@/services/json-socket';
+
+const JOYSTICK_SIZE = 140;
+const JOYSTICK_KNOB_SIZE = 60;
+const JOYSTICK_MAX_DISTANCE = (JOYSTICK_SIZE - JOYSTICK_KNOB_SIZE) / 2;
 
 export default function ManualScreen() {
-     const { api, baseUrl, } = useRobot();
+     const { baseUrl } = useRobot();
      const router = useRouter();
-     const [joystick, setJoystick] = useState({ l: 0, r: 0 });
-     const [error, setError] = useState<string | null>(null);
-     const [isCapturing, setIsCapturing] = useState(false);
-     const [lastSnapshot, setLastSnapshot] = useState<string | null>(null);
+
+     // Stream state
      const [currentFrame, setCurrentFrame] = useState<string | null>(null);
      const [isStreaming, setIsStreaming] = useState(false);
      const [isConnecting, setIsConnecting] = useState(false);
-     const [isLightOn, setIsLightOn] = useState(false)
+     const [error, setError] = useState<string | null>(null);
+     const [isLightOn, setIsLightOn] = useState(false);
      const wsRef = useRef<WebSocket | null>(null);
+
+     // Gimbal state
+     const [gimbalPos, setGimbalPos] = useState({ x: 0, y: 0 });
+     const gimbalRef = useRef({ x: 0, y: 0 });
+
+     // Joystick animated values
+     const joystickX = useSharedValue(0);
+     const joystickY = useSharedValue(0);
+     const joystickActive = useSharedValue(false);
+
+     // Lock to landscape on mount
+     useEffect(() => {
+          if (!ScreenOrientation) return;
+
+          const lockOrientation = async () => {
+               try {
+                    await ScreenOrientation.lockAsync(
+                         ScreenOrientation.OrientationLock.LANDSCAPE_RIGHT
+                    );
+               } catch {
+                    // Orientation lock not supported
+               }
+          };
+          lockOrientation();
+
+          return () => {
+               try {
+                    ScreenOrientation.unlockAsync();
+               } catch {
+                    // Ignore cleanup errors
+               }
+          };
+     }, []);
 
      // WebSocket URL
      const wsUrl = useMemo(() => {
           if (!baseUrl) return undefined;
-
           try {
-               // Normalize URL (add scheme if missing)
                const normalizedUrl = baseUrl.startsWith('http')
                     ? baseUrl
-                    : `http://${baseUrl}`; // default to http for IPs or unknown
-
+                    : `http://${baseUrl}`;
                const parsedUrl = new URL(normalizedUrl);
-
                const host = parsedUrl.hostname;
-
-               // Detect if hostname is IP
-               const isIp =
-                    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
-                    host === "localhost";
-
-               // Set protocol
-               if (isIp) {
-                    parsedUrl.protocol = "ws:";   // <-- IP → always ws
-               } else {
-                    parsedUrl.protocol = parsedUrl.protocol === "https:" ? "wss:" : "ws:";
-               }
-
-               // Set the WS path
-               parsedUrl.pathname =
-                    `${parsedUrl.pathname.replace(/\/$/, "")}/camera/ws`;
-
-               parsedUrl.search = "";
-
+               const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host === 'localhost';
+               parsedUrl.protocol = isIp ? 'ws:' : parsedUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+               parsedUrl.pathname = `${parsedUrl.pathname.replace(/\/$/, '')}/camera/ws`;
+               parsedUrl.search = '';
                return parsedUrl.toString();
-          } catch (err) {
-               console.warn("Invalid base URL for WebSocket", err);
+          } catch {
                return undefined;
           }
      }, [baseUrl]);
 
-
-
+     // WebSocket connection
      const connectWebSocket = useCallback(() => {
           if (!wsUrl) {
                setError('No WebSocket URL available');
                return;
           }
 
-          // Close any existing connection
           if (wsRef.current) {
                wsRef.current.close();
                wsRef.current = null;
@@ -88,24 +121,19 @@ export default function ManualScreen() {
           setIsConnecting(true);
           setError(null);
 
-          console.log('Connecting to WebSocket:', wsUrl);
-
-          // Set a connection timeout
           const connectionTimeout = setTimeout(() => {
-               if (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING) {
-                    console.log('WebSocket connection timeout');
+               if (wsRef.current?.readyState === WebSocket.CONNECTING) {
                     wsRef.current.close();
-                    setError('Connection timeout - check robot is online');
+                    setError('Connection timeout');
                     setIsConnecting(false);
                }
-          }, 10000); // 10 second timeout
+          }, 10000);
 
           const ws = new WebSocket(wsUrl);
           wsRef.current = ws;
 
           ws.onopen = () => {
                clearTimeout(connectionTimeout);
-               console.log('WebSocket connected');
                setIsConnecting(false);
                setIsStreaming(true);
                setError(null);
@@ -114,43 +142,31 @@ export default function ManualScreen() {
           ws.onmessage = (event) => {
                try {
                     const data = JSON.parse(event.data);
-
                     if (data.error) {
-                         console.error('Stream error:', data.error);
                          setError(data.error);
                          return;
                     }
-
                     if (data.frame) {
-                         // Update frame with base64 data
                          setCurrentFrame(`data:image/jpeg;base64,${data.frame}`);
                     }
-               } catch (err) {
-                    console.error('Error parsing WebSocket message:', err);
+               } catch {
+                    // Ignore parse errors
                }
           };
 
-          ws.onerror = (event) => {
+          ws.onerror = () => {
                clearTimeout(connectionTimeout);
-               console.error('WebSocket error:', event);
-               setError('Cannot reach robot camera - verify connection');
+               setError('Connection failed');
                setIsConnecting(false);
                setIsStreaming(false);
           };
 
           ws.onclose = (event) => {
                clearTimeout(connectionTimeout);
-               console.log('WebSocket closed:', event.code, event.reason);
                setIsStreaming(false);
                setIsConnecting(false);
-
-               // Provide helpful error messages based on close code
-               if (!event.wasClean) {
-                    if (event.code === 1006) {
-                         setError('Robot not reachable - check WiFi connection');
-                    } else {
-                         setError(`Connection lost (code ${event.code})`);
-                    }
+               if (!event.wasClean && event.code === 1006) {
+                    setError('Connection lost');
                }
           };
      }, [wsUrl]);
@@ -165,298 +181,438 @@ export default function ManualScreen() {
           setCurrentFrame(null);
      }, []);
 
-     // Auto-start streaming when wsUrl becomes available
+     // Auto-connect
      useEffect(() => {
           if (wsUrl && !isStreaming && !isConnecting) {
-               console.log('Auto-starting stream...');
                connectWebSocket();
           }
      }, [wsUrl, isStreaming, isConnecting, connectWebSocket]);
 
-     // Cleanup on unmount
+     // Cleanup
      useEffect(() => {
           return () => {
                disconnectWebSocket();
           };
      }, [disconnectWebSocket]);
 
-     const handleToggleStream = useCallback(() => {
-          if (isStreaming || isConnecting) {
-               disconnectWebSocket();
-          } else {
-               connectWebSocket();
-          }
-     }, [isStreaming, isConnecting, connectWebSocket, disconnectWebSocket]);
-
-     const resolveSnapshotUrl = useCallback(() => {
-          if (!baseUrl) {
-               return null;
-          }
-          const cacheBuster = Date.now();
-          return `${api.snapshotUrl}?ts=${cacheBuster}`;
-     }, [api, baseUrl]);
-
-     const handleSnapshot = useCallback(async () => {
-          setIsCapturing(true);
-          try {
-               const metadata = await api.capturePhoto();
-               const url =
-                    (metadata?.url as string | undefined) ||
-                    (metadata?.snapshotUrl as string | undefined) ||
-                    (metadata?.imageUrl as string | undefined) ||
-                    (metadata?.path as string | undefined) ||
-                    resolveSnapshotUrl();
-               setLastSnapshot(url ?? null);
-          } catch (error) {
-               console.warn('Snapshot failed', error);
-               setLastSnapshot(resolveSnapshotUrl());
-          } finally {
-               setIsCapturing(false);
-          }
-     }, [api, resolveSnapshotUrl]);
-
-
-     const handleLightCTL = useCallback(
-          () => {
-               cmdJsonCmd({ T: cmd_lights_ctrl, IO4: isLightOn ? 0 : 115, IO5: isLightOn ? 0 : 115 }, baseUrl);
-               setIsLightOn(!isLightOn)
+     // Send movement command
+     const sendMovement = useCallback(
+          (left: number, right: number) => {
+               cmdJsonCmd({ T: cmd_movition_ctrl, L: left, R: right }, baseUrl);
           },
-          [baseUrl, isLightOn],
+          [baseUrl]
      );
 
+     // Send gimbal command
+     const sendGimbal = useCallback(
+          (x: number, y: number) => {
+               const command: GimbalCommand = {
+                    T: cmd_gimbal_ctrl,
+                    X: Math.round(x),
+                    Y: Math.round(y),
+                    SPD: 20,
+               };
+               cmdJsonCmd(command, baseUrl);
+          },
+          [baseUrl]
+     );
+
+     // Joystick gesture
+     const joystickGesture = Gesture.Pan()
+          .onBegin(() => {
+               joystickActive.value = true;
+          })
+          .onUpdate((event) => {
+               const distance = Math.sqrt(event.translationX ** 2 + event.translationY ** 2);
+               const clampedDistance = Math.min(distance, JOYSTICK_MAX_DISTANCE);
+               const angle = Math.atan2(event.translationY, event.translationX);
+
+               joystickX.value = Math.cos(angle) * clampedDistance;
+               joystickY.value = Math.sin(angle) * clampedDistance;
+
+               // Calculate motor speeds (tank drive)
+               const normalizedX = joystickX.value / JOYSTICK_MAX_DISTANCE;
+               const normalizedY = -joystickY.value / JOYSTICK_MAX_DISTANCE; // Invert Y
+
+               // Tank drive calculation
+               const leftSpeed = (normalizedY + normalizedX) * max_speed;
+               const rightSpeed = (normalizedY - normalizedX) * max_speed;
+
+               runOnJS(sendMovement)(leftSpeed, rightSpeed);
+          })
+          .onEnd(() => {
+               joystickX.value = withSpring(0, { damping: 15, stiffness: 150 });
+               joystickY.value = withSpring(0, { damping: 15, stiffness: 150 });
+               joystickActive.value = false;
+               runOnJS(sendMovement)(0, 0);
+          });
+
+     const joystickKnobStyle = useAnimatedStyle(() => ({
+          transform: [
+               { translateX: joystickX.value },
+               { translateY: joystickY.value },
+          ],
+     }));
+
+     // Gimbal gesture (touch on video area)
+     const gimbalGesture = Gesture.Pan()
+          .onUpdate((event) => {
+               // Map screen position to gimbal angles
+               // Pan: -180 to 180, Tilt: -30 to 90
+               const panDelta = event.translationX * 0.5;
+               const tiltDelta = -event.translationY * 0.3;
+
+               const newX = Math.max(-180, Math.min(180, gimbalRef.current.x + panDelta));
+               const newY = Math.max(-30, Math.min(90, gimbalRef.current.y + tiltDelta));
+
+               runOnJS(sendGimbal)(newX, newY);
+          })
+          .onEnd((event) => {
+               // Update stored position
+               const panDelta = event.translationX * 0.5;
+               const tiltDelta = -event.translationY * 0.3;
+
+               gimbalRef.current.x = Math.max(-180, Math.min(180, gimbalRef.current.x + panDelta));
+               gimbalRef.current.y = Math.max(-30, Math.min(90, gimbalRef.current.y + tiltDelta));
+
+               runOnJS(setGimbalPos)({ ...gimbalRef.current });
+          });
+
+     // Light control
+     const handleLightToggle = useCallback(() => {
+          cmdJsonCmd(
+               { T: cmd_lights_ctrl, IO4: isLightOn ? 0 : 115, IO5: isLightOn ? 0 : 115 },
+               baseUrl
+          );
+          setIsLightOn(!isLightOn);
+     }, [baseUrl, isLightOn]);
+
+     // Center gimbal
+     const handleCenterGimbal = useCallback(() => {
+          gimbalRef.current = { x: 0, y: 0 };
+          setGimbalPos({ x: 0, y: 0 });
+          sendGimbal(0, 0);
+     }, [sendGimbal]);
+
      return (
-          <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
-               <ThemedView style={styles.container}>
-                    <View style={styles.headerRow}>
-                         <Pressable style={styles.backButton} onPress={() => router.back()}>
-                              <IconSymbol name="chevron.left" size={16} color="#E5E7EB" />
-                         </Pressable>
-                         <ThemedText type="title">Manual control</ThemedText>
-                    </View>
+          <GestureHandlerRootView style={styles.container}>
+               <StatusBar hidden />
 
-                    {/* {wsUrl && (
-                         <View style={styles.statusBar}>
-                              <ThemedText style={styles.statusText}>
-                                   {isConnecting ? 'Connecting...' :
-                                        isStreaming ? `Streaming | ${frameCount} frames | ${fps.toFixed(1)} fps` :
-                                             'Disconnected'}
-                              </ThemedText>
-                              <Pressable
-                                   style={[
-                                        styles.streamButton,
-                                        isStreaming && styles.streamButtonActive,
-                                        isConnecting && styles.streamButtonConnecting
-                                   ]}
-                                   onPress={handleToggleStream}
-                                   disabled={isConnecting}
-                              >
+               {/* Fullscreen Camera Feed */}
+               <GestureDetector gesture={gimbalGesture}>
+                    <Animated.View style={styles.cameraContainer}>
+                         {currentFrame ? (
+                              <Image source={{ uri: currentFrame }} style={styles.cameraFeed} resizeMode="cover" />
+                         ) : (
+                              <View style={styles.cameraPlaceholder}>
                                    {isConnecting ? (
-                                        <ActivityIndicator size="small" color="#04110B" />
+                                        <ActivityIndicator size="large" color="#1DD1A1" />
+                                   ) : error ? (
+                                        <Text style={styles.errorText}>{error}</Text>
                                    ) : (
-                                        <ThemedText style={styles.streamButtonText}>
-                                             {isStreaming ? '⏸ Stop' : '▶ Start'}
-                                        </ThemedText>
+                                        <Text style={styles.placeholderText}>Connecting camera...</Text>
                                    )}
-                              </Pressable>
-                         </View>
-                    )} */}
-
-                    <View style={styles.videoFeed}>
-                         <View style={{ position: "relative" }}>
-                              <View style={{ position: "absolute", zIndex: 2 }}>
-                                   <View style={{ flex: 1, alignItems: "flex-end", justifyContent: "flex-start" }}>
-                                        <Pressable style={styles.feedLight} onPress={handleLightCTL}>
-                                             <IconSymbol name='bolt' size={20} color="#1DD1A1" />
-                                             <Text style={styles.feedLightText}>
-                                                  {isLightOn ? "ON" : "OFF"}
-                                             </Text>
-                                        </Pressable>
-                                   </View>
                               </View>
-                         </View>
-                         <CameraVideo
-                              wsUrl={wsUrl}
-                              currentFrame={currentFrame}
-                              isConnecting={isConnecting}
-                              isStreaming={isStreaming}
-                              error={error}
-                              onToggleStream={handleToggleStream}
-                         />
-                    </View>
-
-                    {/* Connection status */}
-                    <View style={styles.connectionStatus}>
-                         <View style={[
-                              styles.connectionDot,
-                              { backgroundColor: isStreaming ? '#34D399' : isConnecting ? '#FBBF24' : '#EF4444' }
-                         ]} />
-                         <ThemedText style={styles.connectionText}>
-                              {isConnecting ? 'Connecting...' : isStreaming ? 'Live' : 'Disconnected'}
-                         </ThemedText>
-                         {baseUrl && (
-                              <ThemedText style={styles.connectionUrl}>
-                                   {baseUrl.replace(/^https?:\/\//, '')}
-                              </ThemedText>
                          )}
-                    </View>
 
-                    <View style={styles.row}>
-                         <Pressable
-                              style={styles.secondaryButton}
-                              onPress={handleToggleStream}
-                         >
-                              <ThemedText>
-                                   {isConnecting ? 'Cancel' : isStreaming ? 'Reconnect' : 'Connect'}
-                              </ThemedText>
-                         </Pressable>
-                         <Pressable style={styles.primaryButton} onPress={handleSnapshot}>
-                              {isCapturing ? (
-                                   <ActivityIndicator color="#04110B" />
-                              ) : (
-                                   <ThemedText style={styles.primaryText}>Capture photo</ThemedText>
-                              )}
-                         </Pressable>
-                    </View>
+                         {/* Gimbal crosshair overlay */}
+                         <View style={styles.crosshairContainer} pointerEvents="none">
+                              <View style={styles.crosshairH} />
+                              <View style={styles.crosshairV} />
+                              <View style={styles.crosshairCenter} />
+                         </View>
 
-                    {lastSnapshot ? (
-                         <ThemedView style={styles.snapshotCard}>
-                              <ThemedText type="subtitle">Latest snapshot</ThemedText>
-                              <Image
-                                   source={{ uri: lastSnapshot }}
-                                   style={styles.snapshot}
-                                   contentFit="cover"
+                         {/* Touch hint */}
+                         <View style={styles.touchHint} pointerEvents="none">
+                              <Text style={styles.touchHintText}>Drag to aim</Text>
+                         </View>
+                    </Animated.View>
+               </GestureDetector>
+
+               {/* HUD Overlay */}
+               <View style={styles.hudContainer} pointerEvents="box-none">
+                    {/* Top bar */}
+                    <View style={styles.topBar}>
+                         {/* Back button */}
+                         <Pressable style={styles.hudButton} onPress={() => router.back()}>
+                              <IconSymbol name="xmark" size={20} color="#FFF" />
+                         </Pressable>
+
+                         {/* Status */}
+                         <View style={styles.statusPill}>
+                              <View
+                                   style={[
+                                        styles.statusDot,
+                                        { backgroundColor: isStreaming ? '#34D399' : isConnecting ? '#FBBF24' : '#EF4444' },
+                                   ]}
                               />
-                         </ThemedView>
-                    ) : null}
+                              <Text style={styles.statusText}>
+                                   {isStreaming ? 'LIVE' : isConnecting ? 'CONNECTING' : 'OFFLINE'}
+                              </Text>
+                         </View>
 
-                    <ThemedView style={styles.joystickCard}>
-                         <Joystick onChange={setJoystick} />
-                         <ThemedText style={styles.joystickValue}>
-                              L: {joystick.l.toFixed(2)} R: {joystick.r.toFixed(2)}
-                         </ThemedText>
-                    </ThemedView>
-               </ThemedView>
-          </SafeAreaView>
+                         {/* Gimbal position */}
+                         <View style={styles.gimbalInfo}>
+                              <Text style={styles.gimbalText}>
+                                   PAN: {gimbalPos.x.toFixed(0)}° | TILT: {gimbalPos.y.toFixed(0)}°
+                              </Text>
+                         </View>
+                    </View>
+
+                    {/* Right side controls */}
+                    <View style={styles.rightControls}>
+                         {/* Light toggle */}
+                         <Pressable
+                              style={[styles.hudButton, isLightOn && styles.hudButtonActive]}
+                              onPress={handleLightToggle}
+                         >
+                              <IconSymbol name="bolt.fill" size={22} color={isLightOn ? '#1DD1A1' : '#FFF'} />
+                         </Pressable>
+
+                         {/* Center gimbal */}
+                         <Pressable style={styles.hudButton} onPress={handleCenterGimbal}>
+                              <IconSymbol name="scope" size={22} color="#FFF" />
+                         </Pressable>
+
+                         {/* Reconnect */}
+                         <Pressable style={styles.hudButton} onPress={connectWebSocket}>
+                              <IconSymbol name="arrow.clockwise" size={22} color="#FFF" />
+                         </Pressable>
+                    </View>
+
+                    {/* Joystick (bottom left) */}
+                    <View style={styles.joystickContainer}>
+                         <GestureDetector gesture={joystickGesture}>
+                              <Animated.View style={styles.joystickBase}>
+                                   <Animated.View style={[styles.joystickKnob, joystickKnobStyle]}>
+                                        <View style={styles.joystickKnobInner} />
+                                   </Animated.View>
+                              </Animated.View>
+                         </GestureDetector>
+                    </View>
+
+                    {/* Emergency stop (bottom right) */}
+                    <View style={styles.emergencyContainer}>
+                         <Pressable
+                              style={styles.emergencyButton}
+                              onPress={() => sendMovement(0, 0)}
+                         >
+                              <Text style={styles.emergencyText}>STOP</Text>
+                         </Pressable>
+                    </View>
+               </View>
+          </GestureHandlerRootView>
      );
 }
 
 const styles = StyleSheet.create({
-     safeArea: {
-          flex: 1,
-          backgroundColor: "#161616",
-     },
      container: {
           flex: 1,
-          padding: 24,
-          gap: 16,
-          backgroundColor: '#161616',
+          backgroundColor: '#000',
      },
-     headerRow: {
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 8
+     cameraContainer: {
+          flex: 1,
+          backgroundColor: '#0A0A0A',
      },
-     backButton: {
-          flexDirection: 'row',
+     cameraFeed: {
+          flex: 1,
+          width: '100%',
+          height: '100%',
+     },
+     cameraPlaceholder: {
+          flex: 1,
           alignItems: 'center',
-          gap: 6,
-          padding: 8,
+          justifyContent: 'center',
+     },
+     placeholderText: {
+          color: '#666',
+          fontSize: 16,
+     },
+     errorText: {
+          color: '#EF4444',
+          fontSize: 16,
+     },
+
+     // Crosshair
+     crosshairContainer: {
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          width: 60,
+          height: 60,
+          marginLeft: -30,
+          marginTop: -30,
+          alignItems: 'center',
+          justifyContent: 'center',
+     },
+     crosshairH: {
+          position: 'absolute',
+          width: 40,
+          height: 1,
+          backgroundColor: 'rgba(29, 209, 161, 0.6)',
+     },
+     crosshairV: {
+          position: 'absolute',
+          width: 1,
+          height: 40,
+          backgroundColor: 'rgba(29, 209, 161, 0.6)',
+     },
+     crosshairCenter: {
+          width: 8,
+          height: 8,
+          borderRadius: 4,
           borderWidth: 1,
-          borderColor: '#202020',
-          backgroundColor: '#1C1C1C',
+          borderColor: 'rgba(29, 209, 161, 0.8)',
      },
-     backButtonText: {
-          color: '#E5E7EB',
+
+     // Touch hint
+     touchHint: {
+          position: 'absolute',
+          bottom: 100,
+          left: '50%',
+          transform: [{ translateX: -50 }],
      },
-     feedLight: {
+     touchHintText: {
+          color: 'rgba(255, 255, 255, 0.4)',
+          fontSize: 12,
+          fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+     },
+
+     // HUD
+     hudContainer: {
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+     },
+
+     // Top bar
+     topBar: {
+          flexDirection: 'row',
+          alignItems: 'center',
+          paddingHorizontal: 16,
+          paddingTop: Platform.OS === 'ios' ? 16 : 8,
+          gap: 12,
+     },
+     hudButton: {
+          width: 44,
+          height: 44,
+          borderRadius: 22,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          alignItems: 'center',
+          justifyContent: 'center',
           borderWidth: 1,
-          borderColor: "#1DD1A1",
-          paddingInline: 6,
-          display: "flex",
-          flexDirection: "row",
-          alignItems: "center",
-          marginVertical: 5
+          borderColor: 'rgba(255, 255, 255, 0.1)',
      },
-     feedLightText: {
-          color: "#1DD1A1",
-          fontSize: 14
+     hudButtonActive: {
+          backgroundColor: 'rgba(29, 209, 161, 0.2)',
+          borderColor: '#1DD1A1',
      },
-     row: {
-          flexDirection: 'row',
-          gap: 16,
-          alignItems: 'center',
-     },
-     connectionStatus: {
+     statusPill: {
           flexDirection: 'row',
           alignItems: 'center',
-          gap: 8,
-          paddingVertical: 8,
           paddingHorizontal: 12,
-          backgroundColor: '#1A1A1A',
-          borderWidth: 1,
-          borderColor: '#252525',
+          paddingVertical: 6,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          borderRadius: 20,
+          gap: 6,
      },
-     connectionDot: {
+     statusDot: {
           width: 8,
           height: 8,
           borderRadius: 4,
      },
-     connectionText: {
-          fontSize: 13,
-          color: '#D1D5DB',
-          fontFamily: 'JetBrainsMono_500Medium',
-     },
-     connectionUrl: {
+     statusText: {
+          color: '#FFF',
           fontSize: 12,
-          color: '#67686C',
-          fontFamily: 'JetBrainsMono_400Regular',
+          fontWeight: '600',
+          fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+     },
+     gimbalInfo: {
           marginLeft: 'auto',
+          paddingHorizontal: 12,
+          paddingVertical: 6,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          borderRadius: 8,
      },
-     videoFeed: {
-          position: "relative",
-          zIndex: 0
+     gimbalText: {
+          color: 'rgba(255, 255, 255, 0.7)',
+          fontSize: 11,
+          fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
      },
-     primaryButton: {
-          flex: 1,
+
+     // Right controls
+     rightControls: {
+          position: 'absolute',
+          right: 16,
+          top: '50%',
+          transform: [{ translateY: -80 }],
+          gap: 12,
+     },
+
+     // Joystick
+     joystickContainer: {
+          position: 'absolute',
+          left: 40,
+          bottom: 40,
+     },
+     joystickBase: {
+          width: JOYSTICK_SIZE,
+          height: JOYSTICK_SIZE,
+          borderRadius: JOYSTICK_SIZE / 2,
+          backgroundColor: 'rgba(30, 30, 32, 0.8)',
+          borderWidth: 2,
+          borderColor: 'rgba(42, 43, 48, 0.8)',
+          alignItems: 'center',
+          justifyContent: 'center',
+     },
+     joystickKnob: {
+          width: JOYSTICK_KNOB_SIZE,
+          height: JOYSTICK_KNOB_SIZE,
+          borderRadius: JOYSTICK_KNOB_SIZE / 2,
+          backgroundColor: 'rgba(42, 43, 48, 0.9)',
+          alignItems: 'center',
+          justifyContent: 'center',
+          shadowColor: '#000',
+          shadowOffset: { width: 0, height: 4 },
+          shadowOpacity: 0.3,
+          shadowRadius: 8,
+          elevation: 8,
+     },
+     joystickKnobInner: {
+          width: JOYSTICK_KNOB_SIZE - 16,
+          height: JOYSTICK_KNOB_SIZE - 16,
+          borderRadius: (JOYSTICK_KNOB_SIZE - 16) / 2,
           backgroundColor: '#1DD1A1',
-          borderRadius: 0,
-          paddingVertical: 16,
+          opacity: 0.8,
+     },
+
+     // Emergency stop
+     emergencyContainer: {
+          position: 'absolute',
+          right: 40,
+          bottom: 40,
+     },
+     emergencyButton: {
+          width: 80,
+          height: 80,
+          borderRadius: 40,
+          backgroundColor: 'rgba(239, 68, 68, 0.9)',
           alignItems: 'center',
+          justifyContent: 'center',
+          borderWidth: 3,
+          borderColor: '#FCA5A5',
+          shadowColor: '#EF4444',
+          shadowOffset: { width: 0, height: 0 },
+          shadowOpacity: 0.5,
+          shadowRadius: 12,
+          elevation: 10,
      },
-     primaryText: {
-          color: '#04110B',
-     },
-     secondaryButton: {
-          flex: 1,
-          borderRadius: 0,
-          paddingVertical: 16,
-          alignItems: 'center',
-          borderWidth: 1,
-          borderColor: '#202020',
-          backgroundColor: '#1B1B1B',
-     },
-     snapshotCard: {
-          gap: 16,
-          padding: 20,
-          borderRadius: 0,
-          borderWidth: 1,
-          borderColor: '#202020',
-          backgroundColor: '#1C1C1C',
-     },
-     snapshot: {
-          width: '100%',
-          aspectRatio: 4 / 3,
-          borderRadius: 0,
-     },
-     joystickCard: {
-          gap: 16,
-          padding: 20,
-          borderRadius: 0,
-          backgroundColor: '#161616',
-          alignItems: 'center',
-     },
-     joystickValue: {
-          fontVariant: ['tabular-nums'],
-          color: '#E5E7EB',
+     emergencyText: {
+          color: '#FFF',
+          fontSize: 14,
+          fontWeight: '800',
+          letterSpacing: 1,
      },
 });

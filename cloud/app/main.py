@@ -665,6 +665,19 @@ async def json_control_websocket(websocket: WebSocket):
                     except Exception as exc:
                         LOGGER.warning("Lights control failed: %s", exc)
                         
+            elif cmd_type == 133:  # Gimbal command
+                pan = float(data.get("X", 0))
+                tilt = float(data.get("Y", 0))
+                speed = int(data.get("SPD", 10))
+                
+                if base_controller and hasattr(base_controller, "gimbal_ctrl"):
+                    try:
+                        await anyio.to_thread.run_sync(
+                            base_controller.gimbal_ctrl, pan, tilt, speed, 0
+                        )
+                    except Exception as exc:
+                        LOGGER.warning("Gimbal control failed: %s", exc)
+                        
     except Exception as exc:
         LOGGER.debug("JSON WebSocket closed: %s", exc)
     finally:
